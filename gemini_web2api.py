@@ -436,7 +436,22 @@ class GeminiHandler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length else b""
-            if self.path == "/v1/chat/completions":
+
+            # --- 模型映射重写逻辑 ---
+            if body:
+                try:
+                    import json
+                    payload = json.loads(body)
+                    requested_model = payload.get("model", "")
+                    # 匹配 gpt-5.2 或其他非 gemini 模型，强制映射为支持的模型
+                    if requested_model == "gpt-5.2" or not requested_model.startswith("gemini"):
+                        payload["model"] = "gemini-3.5-flash" 
+                    body = json.dumps(payload).encode("utf-8")
+                except Exception:
+                    pass
+            # -----------------------
+            
+            if self.path in ("/v1/chat/completions", "/v1/chat/completions/responses"):
                 self.handle_chat(body)
             elif self.path == "/v1/responses":
                 self.handle_responses(body)
@@ -628,24 +643,37 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            ev = {"type": "response.created", "response": {"id": rid, "object": "response", "status": "in_progress", "model": model_name, "output": []}}
-            self.wfile.write(f"event: response.created\ndata: {json.dumps(ev)}\n\n".encode())
+            
+            ev_created = {"type": "response.created", "response": {"id": rid, "object": "response", "status": "in_progress", "model": model_name, "output": []}}
+            self.wfile.write(f"event: response.created\ndata: {json.dumps(ev_created)}\n\n".encode())
+            
             for item in output:
                 if item["type"] == "function_call":
                     ev = {"type": "response.function_call_arguments.done", "item_id": item["id"], "call_id": item["call_id"], "name": item["name"], "arguments": item["arguments"]}
                     self.wfile.write(f"event: response.function_call_arguments.done\ndata: {json.dumps(ev)}\n\n".encode())
                 elif item["type"] == "message":
+                    ev_item_added = {"type": "response.output_item.added", "response_id": rid, "output_index": 0, "item": {"id": item["id"], "type": "message", "role": "assistant", "content": [], "status": "in_progress"}}
+                    self.wfile.write(f"event: response.output_item.added\ndata: {json.dumps(ev_item_added)}\n\n".encode())
+                    
                     for ci, cp in enumerate(item["content"]):
-                        ev = {"type": "response.output_text.done", "item_id": item["id"], "content_index": ci, "text": cp["text"]}
-                        self.wfile.write(f"event: response.output_text.done\ndata: {json.dumps(ev)}\n\n".encode())
+                        ev_part_added = {"type": "response.content_part.added", "response_id": rid, "item_id": item["id"], "output_index": 0, "content_index": ci, "part": {"type": "text", "text": ""}}
+                        self.wfile.write(f"event: response.content_part.added\ndata: {json.dumps(ev_part_added)}\n\n".encode())
+                        
+                        ev_delta = {"type": "response.output_text.delta", "response_id": rid, "item_id": item["id"], "output_index": 0, "content_index": ci, "delta": cp["text"]}
+                        self.wfile.write(f"event: response.output_text.delta\ndata: {json.dumps(ev_delta)}\n\n".encode())
+                        
+                        ev_done = {"type": "response.output_text.done", "response_id": rid, "item_id": item["id"], "output_index": 0, "content_index": ci, "text": cp["text"]}
+                        self.wfile.write(f"event: response.output_text.done\ndata: {json.dumps(ev_done)}\n\n".encode())
+                        
+                    ev_item_done = {"type": "response.output_item.done", "response_id": rid, "output_index": 0, "item": item}
+                    self.wfile.write(f"event: response.output_item.done\ndata: {json.dumps(ev_item_done)}\n\n".encode())
+
             resp_obj = {"id": rid, "object": "response", "status": "completed", "model": model_name, "output": output,
                         "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text)//4, "total_tokens": (len(prompt)+len(text))//4}}
             self.wfile.write(f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': resp_obj})}\n\n".encode())
+            
+            self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
-        else:
-            self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
-                            "model": model_name, "output": output,
-                            "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text)//4, "total_tokens": (len(prompt)+len(text))//4}})
 
 
     # ─── Google Native API (Gemini CLI compatible) ────────────────────────────
